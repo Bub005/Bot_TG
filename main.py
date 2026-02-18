@@ -18,7 +18,8 @@ import torch
 
 # ================= CONFIG =================
 
-TOKEN = "8374523039:AAEwMlQ0_4bm6Wa-536UMYk80gTuA_Kgo5c"
+import os
+TOKEN = os.environ["BOT_TOKEN"]
 
 RSS_FEEDS = [
     "https://spectrum.ieee.org/feed",
@@ -239,3 +240,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
