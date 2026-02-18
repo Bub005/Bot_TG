@@ -1,2 +1,6 @@
 python-telegram-bot
 feedparser
+newspaper3k
+sentence-transformers
+torch
+lxml
