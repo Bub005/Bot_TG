@@ -1,6 +1,5 @@
-newspaper3k==0.2.8
-lxml[html_clean]
-feedparser
-python-telegram-bot==22.6
-sentence-transformers
-torch
+feedparser>=6.0
+python-telegram-bot[job-queue]==22.6
+sentence-transformers>=2.2
+torch>=2.0
+numpy>=1.24
