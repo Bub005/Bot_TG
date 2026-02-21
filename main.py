@@ -1,6 +1,8 @@
+import os
 import logging
 import asyncio
-from datetime import datetime, time, timedelta
+from datetime import time as dtime
+
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     ApplicationBuilder,
@@ -8,127 +10,173 @@ from telegram.ext import (
     CallbackQueryHandler,
     ContextTypes,
 )
+
 from news_fetcher import fetch_articles
 from classifier import classify_article
+from storage import Storage
 
 logging.basicConfig(
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    level=logging.INFO
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    level=logging.INFO,
 )
 logger = logging.getLogger(__name__)
 
 # --- CONFIG ---
-TOKEN = "INSERISCI_TUO_TOKEN"
-SEND_HOUR = 9  # ora invio automatico news
-users_preferences = {}  # {user_id: {"macro":[], "branches":[]}}
-scheduled_tasks = {}
+SEND_HOUR = 9  # ora invio automatico news (locale del server)
 
 # --- DOMINI & RAMI ---
 MACRODOMAINS = {
-    "Ingegneria": ["Elettronica", "Meccanica", "Biotecnologie", "Nanoelettronica", "Automazione"],
+    "Ingegneria": [
+        "Elettronica",
+        "Meccanica",
+        "Biotecnologie",
+        "Nanoelettronica",
+        "Automazione",
+    ],
     "Finanza": ["Mercati", "Investimenti", "Criptovalute"],
-    "Politica": ["Internazionale", "Locale", "Europea"]
+    "Politica": ["Internazionale", "Locale", "Europea"],
 }
 
-# --- HELPERS ---
-def get_user_prefs(user_id):
-    if user_id not in users_preferences:
-        users_preferences[user_id] = {"macro": [], "branches": []}
-    return users_preferences[user_id]
 
-# --- MENU INTERATTIVI ---
-def build_macro_keyboard():
+def build_macro_keyboard(prefs: dict) -> InlineKeyboardMarkup:
     keyboard = []
     for macro in MACRODOMAINS:
-        keyboard.append([InlineKeyboardButton(macro, callback_data=f"macro:{macro}")])
+        status = "✅" if macro in prefs["macro"] else ""
+        keyboard.append(
+            [InlineKeyboardButton(f"{macro} {status}".strip(), callback_data=f"macro:{macro}")]
+        )
+    keyboard.append([InlineKeyboardButton("Fine", callback_data="close")])
     return InlineKeyboardMarkup(keyboard)
 
-def build_branches_keyboard(user_id):
-    prefs = get_user_prefs(user_id)
+
+def build_branches_keyboard(prefs: dict) -> InlineKeyboardMarkup:
     keyboard = []
-    for macro, branches in MACRODOMAINS.items():
+    for _, branches in MACRODOMAINS.items():
         for b in branches:
             status = "✅" if b in prefs["branches"] else ""
-            keyboard.append([InlineKeyboardButton(f"{b} {status}", callback_data=f"branch:{b}")])
+            keyboard.append(
+                [InlineKeyboardButton(f"{b} {status}".strip(), callback_data=f"branch:{b}")]
+            )
+    keyboard.append([InlineKeyboardButton("Fine", callback_data="close")])
     return InlineKeyboardMarkup(keyboard)
 
-# --- COMMAND HANDLERS ---
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "Benvenuto! Usa i comandi:\n/domains\n/branches\n/sub_macro\n/sub_branches\n/uns_macro\n/uns_branches\n/preferences\n/all"
+        "Benvenuto!\n\n"
+        "Comandi:\n"
+        "/domains - scegli macrodomini\n"
+        "/branches - scegli rami\n"
+        "/preferences - mostra preferenze\n"
+        "/all - mostra alcune news\n\n"
+        "Riceverai automaticamente le news ogni giorno se hai avviato il bot almeno una volta."
     )
+
 
 async def domains(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "Seleziona un macrodominio:", reply_markup=build_macro_keyboard()
-    )
+    storage: Storage = context.application.bot_data["storage"]
+    user_id = update.message.from_user.id
+    prefs = storage.get_user_prefs(user_id)
+    await update.message.reply_text("Seleziona un macrodominio:", reply_markup=build_macro_keyboard(prefs))
+
 
 async def branches(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "Seleziona i rami:", reply_markup=build_branches_keyboard(update.message.from_user.id)
-    )
+    storage: Storage = context.application.bot_data["storage"]
+    user_id = update.message.from_user.id
+    prefs = storage.get_user_prefs(user_id)
+    await update.message.reply_text("Seleziona i rami:", reply_markup=build_branches_keyboard(prefs))
+
 
 async def preferences(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    prefs = get_user_prefs(update.message.from_user.id)
+    storage: Storage = context.application.bot_data["storage"]
+    user_id = update.message.from_user.id
+    prefs = storage.get_user_prefs(user_id)
     await update.message.reply_text(
         f"Preferenze attuali:\nMacro: {prefs['macro']}\nRami: {prefs['branches']}"
     )
 
+
 async def all_news(update: Update, context: ContextTypes.DEFAULT_TYPE):
     articles = await fetch_articles()
-    for art in articles[:5]:  # limit per debug
+    if not articles:
+        await update.message.reply_text("Nessun articolo trovato.")
+        return
+    for art in articles[:5]:
         await update.message.reply_text(f"{art['title']}\n{art['url']}")
 
-# --- CALLBACK HANDLER ---
+
 async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    storage: Storage = context.application.bot_data["storage"]
+
     query = update.callback_query
     await query.answer()
+
     data = query.data
     user_id = query.from_user.id
-    prefs = get_user_prefs(user_id)
+
+    if data == "close":
+        await query.edit_message_text("Ok.")
+        return
+
+    prefs = storage.get_user_prefs(user_id)
 
     if data.startswith("macro:"):
-        macro = data.split(":")[1]
-        if macro not in prefs["macro"]:
-            prefs["macro"].append(macro)
-        await query.edit_message_text("Macrodomini aggiornati", reply_markup=build_macro_keyboard())
+        macro = data.split(":", 1)[1]
+        prefs = storage.toggle_macro(user_id, macro)
+        await query.edit_message_text(
+            "Macrodomini aggiornati (clicca per attivare/disattivare):",
+            reply_markup=build_macro_keyboard(prefs),
+        )
+        return
 
     if data.startswith("branch:"):
-        branch = data.split(":")[1]
-        if branch not in prefs["branches"]:
-            prefs["branches"].append(branch)
-        else:
-            prefs["branches"].remove(branch)
-        await query.edit_message_text("Rami aggiornati", reply_markup=build_branches_keyboard(user_id))
+        branch = data.split(":", 1)[1]
+        prefs = storage.toggle_branch(user_id, branch)
+        await query.edit_message_text(
+            "Rami aggiornati (clicca per attivare/disattivare):",
+            reply_markup=build_branches_keyboard(prefs),
+        )
+        return
 
-# --- SCHEDULING ---
-async def send_daily_news(context: ContextTypes.DEFAULT_TYPE):
+
+async def send_daily_news_job(context: ContextTypes.DEFAULT_TYPE):
+    """JobQueue callback: invia news filtrate a tutti gli utenti salvati."""
+    storage: Storage = context.application.bot_data["storage"]
+
     articles = await fetch_articles()
-    for user_id, prefs in users_preferences.items():
-        user_articles = []
+    if not articles:
+        return
+
+    users = storage.list_users()
+    for user_id in users:
+        prefs = storage.get_user_prefs(user_id)
+        user_msgs = []
         for art in articles:
             art_macro, art_branch = classify_article(art["title"])
             if (not prefs["macro"] or art_macro in prefs["macro"]) and (
                 not prefs["branches"] or art_branch in prefs["branches"]
             ):
-                user_articles.append(f"{art['title']}\n{art['url']}")
-        for msg in user_articles:
-            await context.bot.send_message(chat_id=user_id, text=msg)
+                user_msgs.append(f"{art['title']}\n{art['url']}")
 
-async def schedule_daily(app):
-    now = datetime.now()
-    target = datetime.combine(now.date(), time(hour=SEND_HOUR))
-    if now > target:
-        target += timedelta(days=1)
-    delay = (target - now).total_seconds()
-    await asyncio.sleep(delay)
-    while True:
-        await send_daily_news(app)
-        await asyncio.sleep(24*60*60)
+        for msg in user_msgs:
+            try:
+                await context.bot.send_message(chat_id=user_id, text=msg)
+            except Exception:
+                logger.exception("Errore invio messaggio a user_id=%s", user_id)
 
-# --- MAIN ---
+
 def main():
-    app = ApplicationBuilder().token(TOKEN).build()
+    token = os.getenv("BOT_TOKEN")
+    if not token:
+        raise RuntimeError("Variabile d'ambiente BOT_TOKEN mancante. Esegui: export BOT_TOKEN='...'" )
+
+    app = ApplicationBuilder().token(token).build()
+
+    # storage persistente
+    storage = Storage("bot.db")
+    app.bot_data["storage"] = storage
+
+    # handlers
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("domains", domains))
     app.add_handler(CommandHandler("branches", branches))
@@ -136,9 +184,11 @@ def main():
     app.add_handler(CommandHandler("all", all_news))
     app.add_handler(CallbackQueryHandler(button))
 
-    # scheduling background
-    asyncio.create_task(schedule_daily(app))
+    # job giornaliero
+    app.job_queue.run_daily(send_daily_news_job, time=dtime(hour=SEND_HOUR, minute=0, second=0))
+
     app.run_polling()
+
 
 if __name__ == "__main__":
     main()
