@@ -1,9 +1,14 @@
-# per ora semplicemente assegna macro e branch keyword-based
-def classify_article(title):
-    title_lower = title.lower()
-    # Macro e branch semplificate
-    if "biotech" in title_lower or "nano" in title_lower or "robot" in title_lower:
+def classify_article(title: str):
+    title_lower = (title or "").lower()
+
+    # Esempio minimale: qui puoi espandere mapping/keyword
+    if any(k in title_lower for k in ["biotech", "bio", "nano", "robot", "automation", "automazione"]):
         return "Ingegneria", "Automazione"
-    if "mechanical" in title_lower or "meccanica" in title_lower:
+    if any(k in title_lower for k in ["mechanical", "meccanica"]):
         return "Ingegneria", "Meccanica"
+    if any(k in title_lower for k in ["crypto", "bitcoin", "ethereum", "criptovalute"]):
+        return "Finanza", "Criptovalute"
+    if any(k in title_lower for k in ["election", "elezioni", "parlamento", "government", "governo"]):
+        return "Politica", "Locale"
+
     return "Generale", "Altro"
