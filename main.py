@@ -1,30 +1,44 @@
-import os
 import logging
-import asyncio
+import os
 from datetime import time as dtime
+from typing import List
 
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram.constants import ParseMode
 from telegram.ext import (
     ApplicationBuilder,
-    CommandHandler,
     CallbackQueryHandler,
+    CommandHandler,
     ContextTypes,
 )
 
-from news_fetcher import fetch_articles
 from classifier import classify_article
+from news_fetcher import fetch_articles
+from rate_limit import RateLimiter
 from storage import Storage
 
+# ---------------------------------------------------------------------------
+# Logging
+# ---------------------------------------------------------------------------
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     level=logging.INFO,
 )
 logger = logging.getLogger(__name__)
 
-# --- CONFIG ---
-SEND_HOUR = 9  # ora invio automatico news (locale del server)
+# ---------------------------------------------------------------------------
+# Config
+# ---------------------------------------------------------------------------
+SEND_HOUR: int = int(os.getenv("SEND_HOUR", "9"))
+PAGE_SIZE: int = 5
+MAX_DIGEST_ITEMS: int = int(os.getenv("MAX_DIGEST_ITEMS", "20"))
+ADMIN_CHAT_ID: int | None = (
+    int(_admin_id) if (_admin_id := os.getenv("ADMIN_CHAT_ID")) else None
+)
 
-# --- DOMINI & RAMI ---
+# ---------------------------------------------------------------------------
+# Domain / branch structure
+# ---------------------------------------------------------------------------
 MACRODOMAINS = {
     "Ingegneria": [
         "Elettronica",
@@ -37,156 +51,473 @@ MACRODOMAINS = {
     "Politica": ["Internazionale", "Locale", "Europea"],
 }
 
+ALL_MACROS: List[str] = list(MACRODOMAINS.keys())
+ALL_BRANCHES: List[str] = [b for bs in MACRODOMAINS.values() for b in bs]
 
-def build_macro_keyboard(prefs: dict) -> InlineKeyboardMarkup:
-    keyboard = []
-    for macro in MACRODOMAINS:
-        status = "✅" if macro in prefs["macro"] else ""
-        keyboard.append(
-            [InlineKeyboardButton(f"{macro} {status}".strip(), callback_data=f"macro:{macro}")]
+# ---------------------------------------------------------------------------
+# Rate limiters
+# ---------------------------------------------------------------------------
+CMD_LIMITER = RateLimiter(max_calls=5, window_seconds=30)
+CB_LIMITER = RateLimiter(max_calls=15, window_seconds=30)
+
+# ---------------------------------------------------------------------------
+# Keyboard builders
+# ---------------------------------------------------------------------------
+
+def _build_menu_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton("🌐 Macrodomini", callback_data="open_macro"),
+                InlineKeyboardButton("🔀 Rami", callback_data="open_branch"),
+            ],
+            [
+                InlineKeyboardButton("📋 Preferenze", callback_data="show_prefs"),
+                InlineKeyboardButton("📰 News Ora", callback_data="news_now"),
+            ],
+            [InlineKeyboardButton("🔄 Reset preferenze", callback_data="reset_prefs")],
+        ]
+    )
+
+
+def _build_macro_keyboard(prefs: dict) -> InlineKeyboardMarkup:
+    rows = []
+    for macro in ALL_MACROS:
+        tick = "✅ " if macro in prefs["macro"] else ""
+        rows.append(
+            [InlineKeyboardButton(f"{tick}{macro}", callback_data=f"macro:{macro}")]
         )
-    keyboard.append([InlineKeyboardButton("Fine", callback_data="close")])
-    return InlineKeyboardMarkup(keyboard)
+    rows.append(
+        [
+            InlineKeyboardButton("✔ Tutti", callback_data="sel_all_m"),
+            InlineKeyboardButton("✖ Nessuno", callback_data="sel_none_m"),
+        ]
+    )
+    rows.append(
+        [
+            InlineKeyboardButton("🔄 Reset", callback_data="reset_prefs"),
+            InlineKeyboardButton("✅ Fine", callback_data="close"),
+        ]
+    )
+    return InlineKeyboardMarkup(rows)
 
 
-def build_branches_keyboard(prefs: dict) -> InlineKeyboardMarkup:
-    keyboard = []
-    for _, branches in MACRODOMAINS.items():
+def _build_branch_keyboard(prefs: dict) -> InlineKeyboardMarkup:
+    rows = []
+    for macro, branches in MACRODOMAINS.items():
+        row = []
         for b in branches:
-            status = "✅" if b in prefs["branches"] else ""
-            keyboard.append(
-                [InlineKeyboardButton(f"{b} {status}".strip(), callback_data=f"branch:{b}")]
+            tick = "✅ " if b in prefs["branches"] else ""
+            row.append(
+                InlineKeyboardButton(f"{tick}{b}", callback_data=f"branch:{b}")
             )
-    keyboard.append([InlineKeyboardButton("Fine", callback_data="close")])
-    return InlineKeyboardMarkup(keyboard)
+            if len(row) == 2:
+                rows.append(row)
+                row = []
+        if row:
+            rows.append(row)
+    rows.append(
+        [
+            InlineKeyboardButton("✔ Tutti", callback_data="sel_all_b"),
+            InlineKeyboardButton("✖ Nessuno", callback_data="sel_none_b"),
+        ]
+    )
+    rows.append(
+        [
+            InlineKeyboardButton("🔄 Reset", callback_data="reset_prefs"),
+            InlineKeyboardButton("✅ Fine", callback_data="close"),
+        ]
+    )
+    return InlineKeyboardMarkup(rows)
 
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+def _build_news_keyboard(page: int, total: int) -> InlineKeyboardMarkup:
+    total_pages = max(1, (total + PAGE_SIZE - 1) // PAGE_SIZE)
+    nav = []
+    if page > 0:
+        nav.append(InlineKeyboardButton("⬅ Prec", callback_data=f"news_p:{page - 1}"))
+    nav.append(
+        InlineKeyboardButton(f"{page + 1}/{total_pages}", callback_data="noop")
+    )
+    if (page + 1) * PAGE_SIZE < total:
+        nav.append(InlineKeyboardButton("Succ ➡", callback_data=f"news_p:{page + 1}"))
+    return InlineKeyboardMarkup([nav])
+
+
+def _escape_title(title: str) -> str:
+    """Strip MarkdownV2-unsafe chars from an article title."""
+    return title.replace("*", "").replace("[", "").replace("]", "")
+
+
+def _format_news_page(articles: List[dict], page: int) -> str:
+    total = len(articles)
+    total_pages = max(1, (total + PAGE_SIZE - 1) // PAGE_SIZE)
+    start = page * PAGE_SIZE
+    chunk = articles[start : start + PAGE_SIZE]
+    lines = [f"📰 *News — pagina {page + 1}/{total_pages}*\n"]
+    for i, art in enumerate(chunk, start=1):
+        title = _escape_title(art["title"])
+        lines.append(f"{start + i}\\. [{title}]({art['url']})")
+    return "\n".join(lines)
+
+
+def _format_digest(articles: List[dict]) -> str:
+    lines = [f"📰 *Digest giornaliero — {len(articles)} articoli*\n"]
+    for i, art in enumerate(articles, 1):
+        title = _escape_title(art["title"])
+        lines.append(f"{i}\\. [{title}]({art['url']})")
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# Command handlers
+# ---------------------------------------------------------------------------
+
+async def _show_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    text = (
+        "👋 *Benvenuto nel Bot News!*\n\n"
+        "Scegli un'opzione dal menu:"
+    )
+    if update.message:
+        await update.message.reply_text(
+            text, parse_mode=ParseMode.MARKDOWN_V2,
+            reply_markup=_build_menu_keyboard(),
+        )
+    elif update.callback_query:
+        await update.callback_query.edit_message_text(
+            text, parse_mode=ParseMode.MARKDOWN_V2,
+            reply_markup=_build_menu_keyboard(),
+        )
+
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    storage: Storage = context.application.bot_data["storage"]
+    storage.get_user_prefs(update.effective_user.id)  # ensure user is registered
+    await _show_menu(update, context)
+
+
+async def menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not CMD_LIMITER.is_allowed(update.effective_user.id):
+        await update.message.reply_text("⏳ Troppi comandi. Riprova tra qualche secondo.")
+        return
+    await _show_menu(update, context)
+
+
+async def domains(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not CMD_LIMITER.is_allowed(update.effective_user.id):
+        await update.message.reply_text("⏳ Troppi comandi. Riprova tra qualche secondo.")
+        return
+    storage: Storage = context.application.bot_data["storage"]
+    prefs = storage.get_user_prefs(update.message.from_user.id)
     await update.message.reply_text(
-        "Benvenuto!\n\n"
-        "Comandi:\n"
-        "/domains - scegli macrodomini\n"
-        "/branches - scegli rami\n"
-        "/preferences - mostra preferenze\n"
-        "/all - mostra alcune news\n\n"
-        "Riceverai automaticamente le news ogni giorno se hai avviato il bot almeno una volta."
+        "Seleziona i macrodomini di interesse:",
+        reply_markup=_build_macro_keyboard(prefs),
     )
 
 
-async def domains(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def branches(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not CMD_LIMITER.is_allowed(update.effective_user.id):
+        await update.message.reply_text("⏳ Troppi comandi. Riprova tra qualche secondo.")
+        return
     storage: Storage = context.application.bot_data["storage"]
-    user_id = update.message.from_user.id
-    prefs = storage.get_user_prefs(user_id)
-    await update.message.reply_text("Seleziona un macrodominio:", reply_markup=build_macro_keyboard(prefs))
-
-
-async def branches(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    storage: Storage = context.application.bot_data["storage"]
-    user_id = update.message.from_user.id
-    prefs = storage.get_user_prefs(user_id)
-    await update.message.reply_text("Seleziona i rami:", reply_markup=build_branches_keyboard(prefs))
-
-
-async def preferences(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    storage: Storage = context.application.bot_data["storage"]
-    user_id = update.message.from_user.id
-    prefs = storage.get_user_prefs(user_id)
+    prefs = storage.get_user_prefs(update.message.from_user.id)
     await update.message.reply_text(
-        f"Preferenze attuali:\nMacro: {prefs['macro']}\nRami: {prefs['branches']}"
+        "Seleziona i rami di interesse:",
+        reply_markup=_build_branch_keyboard(prefs),
     )
 
 
-async def all_news(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def preferences(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not CMD_LIMITER.is_allowed(update.effective_user.id):
+        await update.message.reply_text("⏳ Troppi comandi. Riprova tra qualche secondo.")
+        return
+    storage: Storage = context.application.bot_data["storage"]
+    prefs = storage.get_user_prefs(update.message.from_user.id)
+    macro_str = ", ".join(prefs["macro"]) if prefs["macro"] else "tutte"
+    branch_str = ", ".join(prefs["branches"]) if prefs["branches"] else "tutti"
+    await update.message.reply_text(
+        f"📋 *Preferenze attuali*\n\nMacro: {macro_str}\nRami: {branch_str}",
+        parse_mode=ParseMode.MARKDOWN_V2,
+    )
+
+
+async def reset(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not CMD_LIMITER.is_allowed(update.effective_user.id):
+        await update.message.reply_text("⏳ Troppi comandi. Riprova tra qualche secondo.")
+        return
+    storage: Storage = context.application.bot_data["storage"]
+    storage.reset_user_prefs(update.message.from_user.id)
+    await update.message.reply_text("✅ Preferenze resettate.")
+
+
+async def all_news(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not CMD_LIMITER.is_allowed(update.effective_user.id):
+        await update.message.reply_text("⏳ Troppi comandi. Riprova tra qualche secondo.")
+        return
+    msg = await update.message.reply_text("⏳ Recupero articoli…")
     articles = await fetch_articles()
     if not articles:
-        await update.message.reply_text("Nessun articolo trovato.")
+        await msg.edit_text("Nessun articolo trovato.")
         return
-    for art in articles[:5]:
-        await update.message.reply_text(f"{art['title']}\n{art['url']}")
+    context.user_data["news_articles"] = articles
+    text = _format_news_page(articles, 0)
+    await msg.edit_text(
+        text,
+        parse_mode=ParseMode.MARKDOWN_V2,
+        reply_markup=_build_news_keyboard(0, len(articles)),
+        disable_web_page_preview=True,
+    )
 
 
-async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    storage: Storage = context.application.bot_data["storage"]
+# ---------------------------------------------------------------------------
+# Callback query handler
+# ---------------------------------------------------------------------------
 
+async def button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
     await query.answer()
 
-    data = query.data
     user_id = query.from_user.id
-
-    if data == "close":
-        await query.edit_message_text("Ok.")
+    if not CB_LIMITER.is_allowed(user_id):
+        await query.answer("⏳ Troppi click. Riprova.", show_alert=True)
         return
 
-    prefs = storage.get_user_prefs(user_id)
+    storage: Storage = context.application.bot_data["storage"]
+    data = query.data
 
+    # ---- noop ----
+    if data == "noop":
+        return
+
+    # ---- menu ----
+    if data == "menu":
+        await _show_menu(update, context)
+        return
+
+    # ---- close ----
+    if data == "close":
+        await query.edit_message_text("✅ Ok.")
+        return
+
+    # ---- show preferences ----
+    if data == "show_prefs":
+        prefs = storage.get_user_prefs(user_id)
+        macro_str = ", ".join(prefs["macro"]) if prefs["macro"] else "tutte"
+        branch_str = ", ".join(prefs["branches"]) if prefs["branches"] else "tutti"
+        await query.edit_message_text(
+            f"📋 Macro: {macro_str}\nRami: {branch_str}",
+            reply_markup=InlineKeyboardMarkup(
+                [[InlineKeyboardButton("🔙 Menu", callback_data="menu")]]
+            ),
+        )
+        return
+
+    # ---- open macro selector ----
+    if data == "open_macro":
+        prefs = storage.get_user_prefs(user_id)
+        await query.edit_message_text(
+            "Seleziona i macrodomini:",
+            reply_markup=_build_macro_keyboard(prefs),
+        )
+        return
+
+    # ---- open branch selector ----
+    if data == "open_branch":
+        prefs = storage.get_user_prefs(user_id)
+        await query.edit_message_text(
+            "Seleziona i rami:",
+            reply_markup=_build_branch_keyboard(prefs),
+        )
+        return
+
+    # ---- reset preferences ----
+    if data == "reset_prefs":
+        storage.reset_user_prefs(user_id)
+        await query.edit_message_text(
+            "✅ Preferenze resettate.",
+            reply_markup=InlineKeyboardMarkup(
+                [[InlineKeyboardButton("🔙 Menu", callback_data="menu")]]
+            ),
+        )
+        return
+
+    # ---- select all / none macros ----
+    if data == "sel_all_m":
+        prefs = storage.set_all_macro(user_id, ALL_MACROS)
+        await query.edit_message_text(
+            "Seleziona i macrodomini:", reply_markup=_build_macro_keyboard(prefs)
+        )
+        return
+    if data == "sel_none_m":
+        prefs = storage.set_all_macro(user_id, [])
+        await query.edit_message_text(
+            "Seleziona i macrodomini:", reply_markup=_build_macro_keyboard(prefs)
+        )
+        return
+
+    # ---- select all / none branches ----
+    if data == "sel_all_b":
+        prefs = storage.set_all_branches(user_id, ALL_BRANCHES)
+        await query.edit_message_text(
+            "Seleziona i rami:", reply_markup=_build_branch_keyboard(prefs)
+        )
+        return
+    if data == "sel_none_b":
+        prefs = storage.set_all_branches(user_id, [])
+        await query.edit_message_text(
+            "Seleziona i rami:", reply_markup=_build_branch_keyboard(prefs)
+        )
+        return
+
+    # ---- toggle macro ----
     if data.startswith("macro:"):
         macro = data.split(":", 1)[1]
         prefs = storage.toggle_macro(user_id, macro)
         await query.edit_message_text(
-            "Macrodomini aggiornati (clicca per attivare/disattivare):",
-            reply_markup=build_macro_keyboard(prefs),
+            "Seleziona i macrodomini:", reply_markup=_build_macro_keyboard(prefs)
         )
         return
 
+    # ---- toggle branch ----
     if data.startswith("branch:"):
         branch = data.split(":", 1)[1]
         prefs = storage.toggle_branch(user_id, branch)
         await query.edit_message_text(
-            "Rami aggiornati (clicca per attivare/disattivare):",
-            reply_markup=build_branches_keyboard(prefs),
+            "Seleziona i rami:", reply_markup=_build_branch_keyboard(prefs)
+        )
+        return
+
+    # ---- news now (from menu) ----
+    if data == "news_now":
+        await query.edit_message_text("⏳ Recupero articoli…")
+        articles = await fetch_articles()
+        if not articles:
+            await query.edit_message_text("Nessun articolo trovato.")
+            return
+        context.user_data["news_articles"] = articles
+        text = _format_news_page(articles, 0)
+        await query.edit_message_text(
+            text,
+            parse_mode=ParseMode.MARKDOWN_V2,
+            reply_markup=_build_news_keyboard(0, len(articles)),
+            disable_web_page_preview=True,
+        )
+        return
+
+    # ---- news pagination ----
+    if data.startswith("news_p:"):
+        page = int(data.split(":", 1)[1])
+        articles: list = context.user_data.get("news_articles", [])
+        if not articles:
+            await query.edit_message_text("Sessione scaduta. Usa /all per ricaricare.")
+            return
+        text = _format_news_page(articles, page)
+        await query.edit_message_text(
+            text,
+            parse_mode=ParseMode.MARKDOWN_V2,
+            reply_markup=_build_news_keyboard(page, len(articles)),
+            disable_web_page_preview=True,
         )
         return
 
 
-async def send_daily_news_job(context: ContextTypes.DEFAULT_TYPE):
-    """JobQueue callback: invia news filtrate a tutti gli utenti salvati."""
+# ---------------------------------------------------------------------------
+# Daily news job
+# ---------------------------------------------------------------------------
+
+async def send_daily_news_job(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """JobQueue callback: send filtered digest to all registered users."""
     storage: Storage = context.application.bot_data["storage"]
 
     articles = await fetch_articles()
     if not articles:
+        logger.info("Daily job: no articles found.")
         return
 
-    users = storage.list_users()
-    for user_id in users:
+    for user_id in storage.list_users():
         prefs = storage.get_user_prefs(user_id)
-        user_msgs = []
-        for art in articles:
-            art_macro, art_branch = classify_article(art["title"])
-            if (not prefs["macro"] or art_macro in prefs["macro"]) and (
-                not prefs["branches"] or art_branch in prefs["branches"]
-            ):
-                user_msgs.append(f"{art['title']}\n{art['url']}")
+        filtered = [
+            art
+            for art in articles[:MAX_DIGEST_ITEMS]
+            if _article_matches(art, prefs)
+        ]
+        if not filtered:
+            continue
+        digest = _format_digest(filtered)
+        try:
+            await context.bot.send_message(
+                chat_id=user_id,
+                text=digest,
+                parse_mode=ParseMode.MARKDOWN_V2,
+                disable_web_page_preview=True,
+            )
+        except Exception:
+            logger.exception("Error sending digest to user_id=%s", user_id)
 
-        for msg in user_msgs:
-            try:
-                await context.bot.send_message(chat_id=user_id, text=msg)
-            except Exception:
-                logger.exception("Errore invio messaggio a user_id=%s", user_id)
+
+def _article_matches(art: dict, prefs: dict) -> bool:
+    if not prefs["macro"] and not prefs["branches"]:
+        return True
+    macro, branch = classify_article(art["title"])
+    macro_ok = not prefs["macro"] or macro in prefs["macro"]
+    branch_ok = not prefs["branches"] or branch in prefs["branches"]
+    return macro_ok and branch_ok
 
 
-def main():
+# ---------------------------------------------------------------------------
+# Error handler
+# ---------------------------------------------------------------------------
+
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    logger.exception("Unhandled exception", exc_info=context.error)
+    if ADMIN_CHAT_ID:
+        try:
+            await context.bot.send_message(
+                chat_id=ADMIN_CHAT_ID,
+                text=f"⚠️ Bot error: {context.error}",
+            )
+        except Exception:
+            pass
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+def main() -> None:
     token = os.getenv("BOT_TOKEN")
     if not token:
-        raise RuntimeError("Variabile d'ambiente BOT_TOKEN mancante. Esegui: export BOT_TOKEN='...'" )
+        raise RuntimeError(
+            "Variabile d'ambiente BOT_TOKEN mancante. Esegui: export BOT_TOKEN='...'"
+        )
 
     app = ApplicationBuilder().token(token).build()
 
-    # storage persistente
-    storage = Storage("bot.db")
+    storage = Storage(os.getenv("DB_PATH", "bot.db"))
     app.bot_data["storage"] = storage
 
-    # handlers
+    # Command handlers
     app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("menu", menu))
     app.add_handler(CommandHandler("domains", domains))
     app.add_handler(CommandHandler("branches", branches))
     app.add_handler(CommandHandler("preferences", preferences))
     app.add_handler(CommandHandler("all", all_news))
+    app.add_handler(CommandHandler("reset", reset))
+
+    # Callback query handler
     app.add_handler(CallbackQueryHandler(button))
 
-    # job giornaliero
-    app.job_queue.run_daily(send_daily_news_job, time=dtime(hour=SEND_HOUR, minute=0, second=0))
+    # Error handler
+    app.add_error_handler(error_handler)
 
+    # Daily digest job
+    app.job_queue.run_daily(
+        send_daily_news_job,
+        time=dtime(hour=SEND_HOUR, minute=0, second=0),
+    )
+
+    logger.info("Bot avviato. Invio digest alle %02d:00.", SEND_HOUR)
     app.run_polling()
 
 
